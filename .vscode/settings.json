@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "stddef.h": "c",
+        "memlib.h": "c"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}

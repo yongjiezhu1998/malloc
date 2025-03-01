@@ -1,43 +1,187 @@
-/*
-典型内存布局：
-+-------------------+-----------------------+-------------------+
-|  Header (WSIZE)   |   Payload (N bytes)   |  Footer (WSIZE)   |
-+-------------------+-----------------------+-------------------+
-^                   ^                       ^
-HDRP(bp)            bp                      FTRP(bp)
-*/
+#include <memlib.h>
+#include <stddef.h>
+#include <mm.h>
 
-/*基本的常量和宏*/
-#define WSIZE           4       /*头部和脚部字的大小*/
-#define DSIZE           8       /*双字的大小*/
-#define CHUNKSIZE       (1<<12) /*初始空闲块的大小和扩展堆时的默认大小*/
+/*创建一个带初始化空闲块的堆*/
+int mm_init(void)
+{
+    void *heap_listp;
+    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void*)-1)
+    {
+        return -1;
+    }
 
-#define MAX(x, y)       ((x) > (y) ? (x) : (y))
+    /*堆起始位置填充一个字用于双字对齐*/
+    PUT(heap_listp, 0);     
+    
+    /*序言块，一头一尾*/
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));  /* Prologue header */
+    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));  /* Prologue footer */
 
-/*将大小和已分配位结合起来并返回一个值，可以把它存放在头部或者脚部*/
-/*/:按位或操作,size后三位预留为0*/
-#define PACK            (size, alloc) ((size) | (alloc))
+    /*结尾块，大小为0的已分配块，只由一个头部组成*/
+    PUT(heap_listp + (3*WSIZE), PACK(0, 1));     /* Epilogue header */
 
-/*读取和返回参数p引用的字*/
-#define GET(p)          (*(unsigned int *)(p))  /*将void*强制类型转换为unsigned int *（自然对齐4字节或者8字节），而char* 指向任意地址（无需对齐）*/
-#define PUT(p, val)     (*(unsigned int *)(p) = (val))
+    heap_listp += (2*WSIZE);
+}
 
-/*从地址p处的头部或者脚部分别返回大小和已分配位*/
-/*0x7=0111, ~取反操作符, &按位与*/
-#define GET_SIZE(p)     (GET(p) & ~0x7)
-#define GET_ALLOC(p)    (GET(p) & 0x1)
+static void *extend_heap(size_t words)
+{
+    char *bp;
+    size_t size;
 
-/*分配返回指向这个块的头部和脚部的指针*/
-/*char *移动一个字节而unsigned int*则移动4个字节，同时也能按字节精确控制地址*/
-#define HDRP(bp)        ((char *)bp - WSIZE)
-/*
-GET_SIZE(HDRP(bp): 内存块总大小：头部、有效负载和脚部
-(char *)bp + GET_SIZE(HDRP(bp)：从有效负载的起始地址 bp 出发，加上块的总大小，理论上指向块末尾的下一个字节。
--DSIZE：脚部和头部WIZE,所以要减去DSIZE
-*/
-#define FTRP(bp)        ((char *)bp + GET_SIZE(HDRP(bp)) - DSIZE)
 
-/*指向后面块和前面块的指针*/
-#define NEXT_BLKP(bp)   ((char *)(bp) + GET_SIZE(HDRP(bp));
-/*从前面这个块的脚步获取前面块的size,减去size就是前面块的bp*/
-#define PREV_BLKP(bp)   ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)));
+    // 将请求大小向上舍入为最接近2字（8字节）的倍数
+    size = (words % 2) ? (words+1)*WSIZE : words*WSIZE;
+    if ((long)(bp = mem_sbrk(size)) == -1)
+    {
+        return NULL;
+    }
+
+    /*将新内存块的头部初始化为大小为size，空闲标志0*/
+    PUT(HDRP(bp), PACK(size, 0));
+    /*设置脚部*/
+    PUT(FTRP(bp), PACK(size, 0));
+    /*设置新的堆结尾*/
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));    /* New epilogue header */
+
+    return coalesce(bp);
+}
+
+/*释放一个块*/
+void mm_free(void *bp)
+{
+    /*释放一个块，并使用边界标记合并将其与所有相邻空闲块在常数时间内合并*/
+    size_t size = GET_SIZE(HDRP(bp));
+
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(HDRP(bp), PACK(size, 0));
+    colalesce(bp);
+}
+
+static void* coalesce(void *bp)
+{
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    size_t size = GET_SIZE(HDRP(bp));
+
+    /*Case1: 前面的块和后面的块都是已分配的*/
+    if(prev_alloc && next_alloc)
+    {
+        return bp;
+    }
+
+    /*Case2: 前面的块是已分配的，后面的块是空闲的*/
+    else if(prev_alloc && !next_alloc)
+    {
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        PUT(HDRP(bp), PACK(size, 0));
+        PUT(FTRP(bp), PACK(szie, 0));
+    }
+
+    /*Case3: 前面的块是空闲的，后面的块是已分配的*/
+    else if(!prev_alloc && next_alloc)
+    {
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        PUT(FTRP(bp), PACK(szie, 0));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        bp = PREV_BLKP(bp);
+    }
+
+    /*Case4: 前面的和后面的块都是空闲的*/
+    else
+    {
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) +
+        GET_SIZE(FTRP(NEXT_BLKP(bp)));
+
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        PUT(HDRP(NEXT_BLKP(bp)), PACK(size, 0));
+        bp = PREV_BLKP(bp);
+    }
+    return bp;
+}
+
+/*从空闲链表分配一个块*/
+void *mm_malloc(size_t size)
+{
+    size_t asize;
+    size_t extendsize;
+    char *bp;
+
+    if (size == 0)
+    {
+        return NULL;
+    }
+
+    /*满足字对齐要求*/
+    if (size < DSIZE)
+    {
+        asize = 2*DSIZE;
+    }
+    else
+    {   
+        /*
+        对齐操作：
+
+            size + DSIZE：用户数据 size 加上头部大小 DSIZE，得到总需求空间。
+
+            + (DSIZE - 1)：通过添加 DSIZE-1，确保后续除法实现向上取整。
+
+            / DSIZE：用整数除法截断多余部分，得到对齐后的块数。
+
+            * DSIZE：将块数转换为实际字节数，确保最终大小是 DSIZE 的整数倍。
+        */
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE -1 )) / DSIZE);
+    }
+
+    /*找到空闲块*/
+    if ((bp = find_fit(asize)) != NULL)
+    {
+        /*放置请求块*/
+        place(bp, size);
+        /*请求块*/
+        return bp;
+    }
+
+    /*不能发现匹配的块，就用一个新的空闲块来扩展堆*/
+    extendsize = MAX(asize, CHUNKSIZE);
+    if ((bp = extend_heap(extend_heap/WSIZE)) == NULL)
+    {
+        return NULL;
+    }
+
+    place(bp, size);
+    return bp;
+}
+
+static void *find_fit(size_t asize)
+{
+    void *bp;
+
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(bp)))
+        {
+            return bp;
+        }
+    }
+
+    return NULL:
+}
+
+static void place(void *bp, size_t asize)
+{
+    size_t csize = GET_SIZE(HDRP(bp));
+
+    if ((csize - asize) > 2*DSIZE)
+    {
+        PUT(HDRP(bp), PACK(asize, 1));
+        PUT(FTRP(bp), PACK(asize, 1));
+        bp = NEXT_BLKP(bp);
+        PUT(HDRP(bp), PACK(csize - asize, 1));
+        PUT(FTRP(bp), PACK(csize - asize, 1));
+    }
+    else
+    {
+        PUT(HDRP(bp), PACK(asize, 1));
+        PUT(FTRP(bp), PACK(asize, 1));
+    }
